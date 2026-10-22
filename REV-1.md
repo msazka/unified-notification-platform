@@ -2,7 +2,7 @@
 Read time: ~10–15 min
 
 #### TL;DR
-* **Problem**: DCS operates four overlapping, fragmented legacy notification systems (System 1 .NET Functions, System 2 Quarkus REST, System 3 Fastify Campaign Engine, System 4 Windows BIRT Engine capped at ~3,080 msgs/hr) sharing uncoordinated Mailjet and Lokalise accounts bounded by a strict 6 req/s token cap.
+* **Problem**: ABC operates four overlapping, fragmented legacy notification systems (System 1 .NET Functions, System 2 Quarkus REST, System 3 Fastify Campaign Engine, System 4 Windows BIRT Engine capped at ~3,080 msgs/hr) sharing uncoordinated Mailjet and Lokalise accounts bounded by a strict 6 req/s token cap.
 * **Proposal**: Build a single, high-throughput Unified Notification Platform providing dual-priority queueing, async Redis translation caching, transactional outbox pattern, and event-driven Mailjet webhook reconciliation.
 * **Key Decisions**:
   1. *Transactional Outbox + Kafka*: Guarantees zero message loss and decouples downstream status reporting.
@@ -15,7 +15,7 @@ Read time: ~10–15 min
 ---
 
 #### 1. Problem Framing
-Digital Charging Solutions (DCS) powers EV charging communications across multiple automotive OEMs and Fleet products. Over time, four overlapping, independently built email systems have accumulated significant technical debt:
+ABC powers EV charging communications across multiple automotive OEMs and Fleet products. Over time, four overlapping, independently built email systems have accumulated significant technical debt:
 * **System 1 (Fleet Transactional)**: .NET Azure Functions firing direct, fire-and-forget HTTP requests to Mailjet, lacking database auditing, retries, or execution logs.
 * **System 2 (Generalized Transactional)**: Quarkus/Kotlin REST service with PostgreSQL auditing, Service Bus webhook publishing, and JobRunr retries.
 * **System 3 (Bulk / Campaign Sender)**: Node/Fastify campaign engine using BullMQ, Redis, server-side MJML rendering, and recipient HTML snapshot audits, but lacking webhook ingestion and transactional APIs.
@@ -97,7 +97,7 @@ flowchart LR
     notificationSystem["<b>Unified Notification Platform</b><br/>Orchestrates, localizes, renders & dispatches notifications"]
   end
 
-  subgraph Internal ["DCS Enterprise Ecosystem"]
+  subgraph Internal ["ABC Enterprise Ecosystem"]
     apiProducers["<b>Synchronous Microservices</b><br/>REST Triggers (OTPs, card orders)"]
     kafkaEvents[("<b>Kafka Domain Event Stream</b><br/>Domain events (mail_document)")]
     customerApi["<b>Customer / Identity API</b><br/>Recipient profiles & brand context"]
