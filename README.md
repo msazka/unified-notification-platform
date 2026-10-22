@@ -1,6 +1,6 @@
 # unified-notification-platform
 ```mermaid
-flowchart TB
+flowchart LR
   %% C4 Level 1: System Context Diagram (GitHub Native)
 
   subgraph Users ["Actors / Users"]
