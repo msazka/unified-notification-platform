@@ -1,52 +1,99 @@
-
 ```mermaid
 %%{init: {'theme': 'base', 'themeVariables': { 'fontSize': '16px', 'nodePadding': '12' }}}%%
 flowchart LR
-%% C4 Level 1: System Context Diagram (GitHub Native)
+  %% C4 Level 2: Container Architecture Diagram (GitHub Native)
 
-    subgraph Users ["Actors / Users"]
-        driver["<b>EV Driver / Fleet Customer</b><br/>Receives notifications, receipts & OTPs"]
-        operator["<b>Campaign / Operations Admin</b><br/>Schedules marketing & configures templates"]
+  subgraph Producers ["Upstream Producers & Clients"]
+    restClients["<b>Synchronous Microservices</b><br/>(OTPs, Card Orders)"]
+    kafkaProducer[("<b>Kafka Event Stream</b><br/>(Billing, Dunning Events)")]
+    adminUI["<b>Campaign Admin UI</b><br/>(React / TypeScript)"]
+  end
+
+  subgraph PlatformBoundary ["Unified Notification Platform"]
+
+    subgraph IngressLayer ["1. Ingress & Trigger Layer"]
+      restApi["<b>REST Ingress API</b><br/>(Quarkus / Kotlin)<br/>Low-latency sync endpoint"]
+      kafkaConsumer["<b>Kafka Event Consumer</b><br/>(Quarkus / Kotlin)<br/>Asynchronous event listener"]
+      campaignApi["<b>Campaign Service</b><br/>(Node / Fastify)<br/>Batching & cohort scheduling"]
     end
 
-    subgraph SystemBoundary ["Unified Platform Boundary"]
-        notificationSystem["<b>Unified Notification Platform</b><br/>Orchestrates, localizes, renders & dispatches notifications"]
+    subgraph ProcessingLayer ["2. Processing & Validation Engine"]
+      processor["<b>Core Processing Engine</b><br/>- Idempotency & Dedup Check<br/>- Profile & Locale Resolution<br/>- Pre-Send Coverage Check"]
     end
 
-    subgraph Internal ["DCS Enterprise Ecosystem"]
-        apiProducers["<b>Synchronous Microservices</b><br/>REST Triggers (OTPs, card orders)"]
-        kafkaEvents[("<b>Kafka Domain Event Stream</b><br/>Domain events (mail_document)")]
-        customerApi["<b>Customer / Identity API</b><br/>Recipient profiles & brand context"]
-        kafkaStatus[("<b>Kafka Status Stream</b><br/>Downstream delivery status events")]
+    subgraph LocalizationLayer ["3. Localization & Template Engine"]
+      templateEngine["<b>MJML/Handlebars Compiler</b><br/>Compiles HTML & brand layouts"]
+      lokaliseSync["<b>Lokalise Sync Worker</b><br/>Async translation fetcher"]
     end
 
-    subgraph External ["External Vendors & Dependencies"]
-        mailjet["<b>Mailjet API & Webhooks</b><br/>Email delivery & feedback loops"]
-        lokalise["<b>Lokalise API</b><br/>Translation management (6 req/s limit)"]
-        pushSms["<b>Push / SMS Providers</b><br/>Pluggable channels (FCM / Twilio)"]
+    subgraph QueueLayer ["4. Dual-Priority Queueing & Dispatch"]
+      highPriorityQ[("<b>High-Priority Queue</b><br/>Kafka Topic / InMemory<br/>(Transactional - < 2s SLA)")]
+      lowPriorityQ[("<b>Low-Priority Queue</b><br/>Redis + BullMQ<br/>(Bulk / Throttled Campaigns)")]
+      dispatcher["<b>Vendor Dispatcher</b><br/>Mailjet Send v3.1 Adapter<br/>(Rate limiting & retries)"]
     end
 
-    driver <==>|"Receives Notifications"| notificationSystem
-    operator -->|"Manages Campaigns"| notificationSystem
+    subgraph FeedbackLayer ["5. Status & Webhook Reconciliation"]
+      webhookHandler["<b>Webhook Receiver</b><br/>Ingests Mailjet events"]
+      statusPublisher["<b>Status Reconciler</b><br/>Updates DB & emits Kafka status"]
+    end
 
-    apiProducers -->|"REST Requests"| notificationSystem
-    kafkaEvents -->|"Consumes Events"| notificationSystem
+    subgraph StorageLayer ["6. Storage Layer"]
+      postgres[("<b>PostgreSQL DB</b><br/>Metadata, outbox, status ledger")]
+      redis[("<b>Redis Datastore</b><br/>Idempotency keys, Lokalise cache, BullMQ")]
+      s3Store[("<b>S3 / Azure Blob Storage</b><br/>Rendered HTML/PDF audit snapshots")]
+    end
 
-    notificationSystem -->|"Queries Profiles"| customerApi
-    notificationSystem -->|"Fetches Translations"| lokalise
-    notificationSystem -->|"Dispatches Emails & Webhooks"| mailjet
-    notificationSystem -->|"Dispatches Push/SMS"| pushSms
+  end
 
-    notificationSystem -->|"Publishes Status"| kafkaStatus
+  subgraph SharedServices ["External Vendors & Shared Ecosystem"]
+    customerApi["<b>Customer / Identity API</b>"]
+    lokaliseApi["<b>Lokalise API</b><br/>(6 req/s limit)"]
+    mailjetApi["<b>Mailjet Send API & Webhooks</b>"]
+    kafkaStatusStream[("<b>Kafka Status Stream</b>")]
+  end
 
-%% Styling for C4 visual look
-    classDef userStyle fill:#084298,stroke:#084298,color:#fff;
-    classDef systemStyle fill:#1168bd,stroke:#0b4884,color:#fff;
-    classDef internalStyle fill:#f8f9fa,stroke:#6c757d,color:#000;
-    classDef externalStyle fill:#6c757d,stroke:#495057,color:#fff;
+  %% Ingress Flows
+  restClients -->|"1a. HTTP POST"| restApi
+  kafkaProducer -->|"1b. Consume Event"| kafkaConsumer
+  adminUI -->|"1c. Schedule Campaign"| campaignApi
 
-    class driver,operator userStyle;
-    class notificationSystem systemStyle;
-    class apiProducers,customerApi internalStyle;
-    class mailjet,lokalise,pushSms externalStyle;
-```
+  restApi & kafkaConsumer & campaignApi -->|"2. Process Request"| processor
+
+  %% Processing & Storage Interactions
+  processor <-->|"Idempotency & Cache"| redis
+  processor -->|"Write Outbox / Ledger"| postgres
+  processor -->|"Fetch Profile"| customerApi
+
+  %% Localization Flows
+  processor -->|"3. Render Template"| templateEngine
+  templateEngine <-->|"Read Translation Cache"| redis
+  lokaliseSync -->|"Async Sync (Bypasses Limit)"| lokaliseApi
+  lokaliseSync -->|"Populate Cache"| redis
+
+  %% Queueing & Dispatch Flows
+  templateEngine -->|"4a. High-Priority"| highPriorityQ
+  templateEngine -->|"4b. Low-Priority"| lowPriorityQ
+  templateEngine -->|"Save Snapshot (30d)"| s3Store
+
+  highPriorityQ & lowPriorityQ -->|"5. Pull Jobs"| dispatcher
+  dispatcher -->|"6. Send Email Payload"| mailjetApi
+
+  %% Webhook Feedback Loop
+  mailjetApi -->|"7. Webhook POST"| webhookHandler
+  webhookHandler -->|"8. Reconcile"| statusPublisher
+  statusPublisher -->|"Update Status"| postgres
+  statusPublisher -->|"Publish Event"| kafkaStatusStream
+
+  %% Styling
+  classDef producerStyle fill:#084298,stroke:#084298,color:#fff;
+  classDef containerStyle fill:#1168bd,stroke:#0b4884,color:#fff;
+  classDef queueStyle fill:#d97706,stroke:#b45309,color:#fff;
+  classDef dbStyle fill:#15803d,stroke:#166534,color:#fff;
+  classDef extStyle fill:#6c757d,stroke:#495057,color:#fff;
+
+  class restClients,kafkaProducer,adminUI producerStyle;
+  class restApi,kafkaConsumer,campaignApi,processor,templateEngine,lokaliseSync,dispatcher,webhookHandler,statusPublisher containerStyle;
+  class highPriorityQ,lowPriorityQ queueStyle;
+  class postgres,redis,s3Store dbStyle;
+  class customerApi,lokaliseApi,mailjetApi,kafkaStatusStream extStyle;
+  ```
