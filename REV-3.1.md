@@ -328,20 +328,20 @@ sequenceDiagram
 
   %% Phase 1: Ingestion & Idempotency
   rect rgb(240, 248, 255)
-    note right of Producer: Phase 1: Ingestion & Idempotency Check
+    Note right of Producer: Phase 1: Ingestion & Idempotency Check
     Producer->>API: POST /v1/notifications (OAuth2 token, Idempotency-Key, use_case, payload)
     API->>DB: Query idempotency record (producer_id + idempotency_key)
-    note right of API: Redis is optional cache; PostgreSQL is authoritative
+    Note right of API: Redis is optional cache - PostgreSQL is authoritative
     alt Duplicate Request Detected
       API-->>Producer: HTTP 202 Accepted (existing notification_id, skip reprocessing)
     else New Request
-      note over API: Proceed to profile resolution & validation
+      Note over API: Proceed to profile resolution & validation
     end
   end
 
   %% Phase 2: Profile, Suppression & Rendering
   rect rgb(250, 240, 230)
-    note right of API: Phase 2: Profile, Suppression & Rendering
+    Note right of API: Phase 2: Profile, Suppression & Rendering
     API->>Cust: GET /customers/{id}
     Cust-->>API: Recipient profile (locale: 'de-DE', brand: 'OEM_A')
     API->>DB: Check suppression list (blocklist / unsubscribe)
@@ -349,7 +349,7 @@ sequenceDiagram
     alt Translation missing AND legal/financial use case
       API->>DB: Store message as FAILED_CONTENT & alert operator
       API-->>Producer: HTTP 202 Accepted (notification_id, status: FAILED_CONTENT)
-      note over API,DB: Flow halts until missing content is published & resolved
+      Note over API,DB: Flow halts until missing content is published & resolved
     else Translation missing AND non-legal use case
       API->>API: Fall back to OEM brand default language
     else Translation present
@@ -360,7 +360,7 @@ sequenceDiagram
 
   %% Phase 3: Transactional Outbox & Dispatch
   rect rgb(240, 255, 240)
-    note right of API: Phase 3: Outbox & Vendor Dispatch
+    Note right of API: Phase 3: Outbox & Vendor Dispatch
     API->>DB: BEGIN TX: Insert message + idempotency record + lane outbox row
     DB-->>API: COMMIT TX
     API-->>Producer: HTTP 202 Accepted (notification_id)
@@ -374,20 +374,20 @@ sequenceDiagram
       Disp->>DB: UPDATE status = PROVIDER_ACCEPTED, vendor_message_id
     else Timeout / Ambiguous HTTP 5xx
       Disp->>DB: UPDATE status = SUBMISSION_UNKNOWN
-      note over Disp,DB: Reconcile via webhooks; do not blindly retry to avoid duplicate sends
+      Note over Disp,DB: Reconcile via webhooks - do not blindly retry to avoid duplicates
     end
   end
 
   %% Phase 4: Webhook Feedback & Status Reconciliation
   rect rgb(255, 245, 245)
-    note right of Webhook: Phase 4: Webhook Feedback & Status Stream
+    Note right of Webhook: Phase 4: Webhook Feedback & Status Stream
     Vendor->>Webhook: POST /webhooks/mailjet (basic auth, event: sent / delivered / bounce)
     Webhook->>DB: INSERT raw event idempotently (MessageID / CustomID + event_id)
     Webhook-->>Vendor: HTTP 200 OK
     Recon->>DB: BEGIN TX: Correlate event, update status ledger, insert status-outbox row
     DB-->>Recon: COMMIT TX
     Recon->>StatusStream: Status-outbox relay publishes event at-least-once
-    note over Recon,StatusStream: Downstream consumers deduplicate using stable event_id
+    Note over Recon,StatusStream: Downstream consumers deduplicate using stable event_id
   end
 
 ## 4. Key decisions
