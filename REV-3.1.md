@@ -92,7 +92,7 @@ Full functional / non-functional requirements (FR*/NFR* referenced below): [appe
 | :--- | :--- | :--- | :--- |
 | A1 | Assumed → Target | **Transactional volume:** ~80 msg/s peak (2 M customers × 10 msgs/month, ×10 peak); design for **300 msg/s**. Today S4 caps at 0.85 msg/s. | Service and partition sizing |
 | A2 | Assumed → Target | **Bulk:** largest campaign 2 M recipients in **4 h** ≈ 140 msg/s | Bulk is throttled |
-| A3 | Assumed | **Mailjet account limit** unknown (Q1) — the real ceiling | Split rate budget, reserved share for urgent/transactional |
+| A3 | Assumed / open question | **Mailjet account limit** unknown (Q1). Peak design load is 300 transactional + ~140 bulk = **~440 messages/s aggregate**, before headroom; Mailjet must confirm this is achievable. | One shared rate budget; reserve urgent/transactional capacity and throttle bulk |
 | A4 | Assumed | **Webhooks:** ~3 events per message | Webhook service sizing; idempotent |
 | A5 | Target | **Latency:** urgent (OTP) P99 < 2 s · transactional (receipts, dunning) P99 < 5 min · bulk ≤ 4 h | Three lanes |
 | A6 | Given | **Lokalise:** 6 req/s, 1 concurrent per token | Content synced ahead, never on the send path |
@@ -102,6 +102,8 @@ Full functional / non-functional requirements (FR*/NFR* referenced below): [appe
 | A10 | Assumed | **Team** of 5–6 engineers | Few services, managed infra |
 | A11 | Assumed | **Mailjet:** webhooks unsigned (basic auth in URL), retried, may repeat; ≤ 50 messages per send call | Store-first idempotent receiver; batching |
 | A12 | Assumed | **Identity:** Keycloak (used by S3), OAuth2 client credentials | No custom auth |
+
+The ~440 messages/s figure is an offered-load target, not a claim about Mailjet capacity. Batches of up to 50 reduce HTTP request count, not the number of recipient messages Mailjet must process. Until Q1 is confirmed, the dispatcher must enforce the provider’s actual account limit, reserve capacity for urgent traffic, and throttle or pause bulk first; if the confirmed limit cannot sustain the target, the 4-hour campaign objective must be revisited.
 
 Full assumption detail and derivations: [appendix](docs/appendix.md#assumption-detail).
 
@@ -213,7 +215,7 @@ flowchart LR
     retryQ[("<b>retry</b> topic")]
     dispatcher["<b>Vendor Dispatcher</b><br/>Rate budget, reserved share<br/>for urgent/transactional (NFR2)<br/>Batching ≤ 50 · retries"]
     postgres[("<b>PostgreSQL</b><br/>Messages, send attempts,<br/>outboxes, campaigns")]
-    redis[("<b>Redis</b><br/>Idempotency keys,<br/>active translations")]
+    redis[("<b>Redis</b><br/>Active translation cache")]
     blobStore[("<b>Azure Blob Storage</b><br/>Rendered snapshots (A8)")]
   end
 
@@ -310,18 +312,17 @@ flowchart LR
 ```
 ### 3.3 Key flows
 ```mermaid
-%%{init: {'theme': 'base', 'themeVariables': { 'fontSize': '16px', 'nodePadding': '12' }}}%%
 sequenceDiagram
   autonumber
-  actor Producer as Upstream Producer<br/>(e.g., OTP)
-  participant API as Ingress + Processing<br/>& Rendering (uses Redis)
+  actor Producer as Upstream Producer (OTP)
+  participant API as Ingress and Rendering
   participant Cust as Customer API
-  participant DB as PostgreSQL<br/>(Messages & Outbox)
-  participant Relay as Outbox Relay (Ingress svc)<br/>→ Kafka urgent topic
+  participant DB as PostgreSQL Messages and Outbox
+  participant Relay as Outbox Relay to Kafka urgent topic
   participant Disp as Vendor Dispatcher
-  participant Vendor as Mailjet Send v3.1 API
+  participant Vendor as Mailjet Send API v3.1
   participant Webhook as Webhook Receiver
-  participant Recon as Status Reconciler<br/>(Webhook svc)
+  participant Recon as Status Reconciler
   participant StatusStream as Kafka Status Stream
 
   %% Phase 1: Ingestion & Idempotency
@@ -341,7 +342,7 @@ sequenceDiagram
     API->>Cust: GET /customers/{id}
     Cust-->>API: Profile (locale: 'de-DE', brand: 'OEM_A')
     API->>DB: Check suppression (blocklist / unsubscribe)
-    API->>API: Read active translations from Redis, coverage check
+    API->>API: Read active translations from optional cache, check coverage
     alt Translation missing AND legal/financial use case
       API->>DB: Store message as FAILED_CONTENT + alert operator
       API-->>Producer: HTTP 202 Accepted (notification_id, status visible via status API)
@@ -391,7 +392,7 @@ Eight decisions, each with the alternative I rejected. #8 is a decision *not* to
 |---|---|---|---|---|
 | 1 | **Transactional outbox + async dispatch** — store message + outbox row in one transaction, return 202 | Sync Mailjet call (S1); dual write DB then Kafka | Mailjet slowness never reaches producers; DB and Kafka can't disagree | P2 |
 | 2 | **Lokalise synced ahead into a local cache**; render reads only the cache | Live Lokalise calls at render time | 6 req/s (A6) can't serve 300 msg/s; Lokalise outage would block sends. Cost: content minutes stale | P1, A6 |
-| 3 | **Three Kafka lanes + reserved rate budget** at the dispatcher | One shared FIFO queue | A 2 M campaign would delay OTPs; separate topics alone don't help because the Mailjet limit is shared | A3, A5 |
+| 3 | **Three Kafka lanes + one enforced Mailjet rate budget** at the dispatcher | One shared FIFO queue or independent per-lane limits | Separate topics isolate backlog but do not create provider capacity. Reserve urgent capacity, cap transactional traffic, and throttle/pause bulk against the confirmed account limit | A3, A5 |
 | 4 | **PostgreSQL** for messages, outbox, status, campaigns | NoSQL (e.g. Cosmos DB) | Outbox needs one ACID transaction; S2/S3 already on Postgres; ~20 M msgs/month fits with monthly partitions | A1 |
 | 5 | **Azure Blob** for rendered snapshots, lifecycle per class | Snapshots in PostgreSQL | Keeps DB and backups small; lifecycle rules enforce A8 | A8 |
 | 6 | **Platform renders** (MJML + Handlebars), templates in git | Mailjet-hosted templates (S1) | One content pipeline fixes drift; preview + coverage check before publish. Cost: we own rendering | P1 |
@@ -574,7 +575,7 @@ Full per-phase action lists: [appendix](docs/appendix.md#migration-detail).
 | **Sender reputation hit by bulk** | Separate sub-accounts or sender domains for bulk (Q2); bounce-rate alert | Auto-pause the campaign |
 | **Template drift while porting ~110 templates** | Shadow render + parity diff per template; dunning first | Flag back to the legacy path per use case |
 
-**Known weaknesses:** outbox polling adds latency to the 2 s urgent lane (short poll for urgent; CDC if needed) · single region, RPO/RTO undefined · four stateful stores for a small team (Redis is the first to remove).
+**Known weaknesses:** outbox polling adds latency to the 2 s urgent lane (short poll for urgent; CDC if needed) · single region, RPO/RTO undefined · Redis is an optional translation cache, not a correctness dependency, and should remain only if load tests justify it.
 
 **What I'd do next**
 1. Answer Q1 (Mailjet limit) and Q3 (legal retention) — they move the design most.
