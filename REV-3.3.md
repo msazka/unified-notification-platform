@@ -241,61 +241,78 @@ flowchart LR
 %%{init: {'theme': 'base', 'themeVariables': { 'fontSize': '14px' }}}%%
 sequenceDiagram
   autonumber
-  actor Producer as Upstream Producer (OTP)
-  participant API as Ingress & Rendering Engine
-  participant DB as PostgreSQL (DB & Outbox)
+  actor Producer as Upstream Producer
+  participant API as Ingress and Rendering Engine
+  participant DB as PostgreSQL
+  participant Outbox as Dispatch Outbox Relay
+  participant Queue as Kafka Priority Topics
   participant Disp as Vendor Dispatcher
-  participant Vendor as Mailjet Send API v3.1
-  participant Webhook as Webhook Receiver & Reconciler
+  participant Vendor as Mailjet Send API
+  participant Webhook as Webhook Receiver
+  participant Status as Status Outbox Relay
   participant StatusStream as Kafka Status Stream
 
-  %% Phase 1: Ingestion, Idempotency & Durable Ack
   rect rgb(240, 248, 255)
-    Note right of Producer: 1. Ingestion, Idempotency & Durable Ack
-    Producer->>API: POST /v1/notifications (Idempotency-Key, payload)
-    API->>DB: Atomic TX: Query idempotency record & unique constraint
-    alt Duplicate Key + Same Payload
+    Note over Producer,DB: Phase 1: Ingestion and durable acknowledgement
+
+    Producer->>API: POST /v1/notifications with Idempotency-Key
+    API->>DB: Check unique producer_id and idempotency_key
+
+    alt Same key and same payload
       DB-->>API: Existing notification record
-      API-->>Producer: HTTP 202 Accepted (return existing notification_id)
-    else Duplicate Key + Different Payload
-      DB-->>API: Payload mismatch
+      API-->>Producer: HTTP 202 with existing notification_id
+    else Same key but different payload
+      DB-->>API: Idempotency conflict
       API-->>Producer: HTTP 409 Conflict
-    else Valid New Request
-      API->>API: Resolve locale & check translation coverage
-      alt Missing Translation (Legal/Financial)
-        API->>DB: Persist FAILED_CONTENT state & alert operator
-        API-->>Producer: HTTP 202 Accepted (notification_id, status: FAILED_CONTENT)
-      else Valid / Non-Legal Fallback
-        API->>DB: BEGIN TX: Insert message + idempotency record + outbox row
-        DB-->>API: COMMIT TX
-        API-->>Producer: HTTP 202 Accepted (notification_id)
+    else New request
+      API->>API: Resolve locale and validate required content
+
+      alt Required legal translation is missing
+        API->>DB: Persist FAILED_CONTENT and alert record
+        DB-->>API: Commit
+        API-->>Producer: HTTP 202 with notification_id and FAILED_CONTENT
+      else Content is valid
+        API->>API: Render notification and prepare snapshot
+        API->>DB: Commit notification, idempotency record and dispatch outbox row
+        DB-->>API: Commit successful
+        API-->>Producer: HTTP 202 with notification_id
       end
     end
   end
 
-  %% Phase 2: Outbox Relay & Mailjet Dispatch
   rect rgb(240, 255, 240)
-    Note right of API: 2. Outbox Relay & Mailjet Dispatch
-    API->>Disp: Outbox Relay reads outbox & dispatches via Kafka
-    Disp->>DB: Persist attempt state (ATTEMPTING, attempt_id)
-    Disp->>Vendor: POST /v3.1/send (payload, CustomID = notification_id)
-    alt Success (HTTP 200)
-      Vendor-->>Disp: HTTP 200 OK (vendor_message_id)
-      Disp->>DB: UPDATE status = PROVIDER_ACCEPTED
-    else Timeout / Ambiguous 5xx
-      Disp->>DB: UPDATE status = SUBMISSION_UNKNOWN
-      Note over Disp,DB: Bounded retries - reconcile via webhooks before retrying (reduces, but cannot eliminate, duplicate sends)
+    Note over DB,Vendor: Phase 2: Outbox publication and vendor dispatch
+
+    Outbox->>DB: Read unpublished dispatch outbox rows
+    DB-->>Outbox: Committed dispatch events
+    Outbox->>Queue: Publish to the appropriate priority topic
+    Queue-->>Disp: Dispatcher consumes message
+    Disp->>DB: Persist attempt state and attempt_id
+    DB-->>Disp: Attempt recorded
+    Disp->>Vendor: POST /v3.1/send with notification_id
+
+    alt Mailjet accepts request
+      Vendor-->>Disp: HTTP 200 and provider message ID
+      Disp->>DB: Record PROVIDER_ACCEPTED
+    else Timeout or ambiguous 5xx
+      Vendor--xDisp: Response missing or ambiguous
+      Disp->>DB: Record SUBMISSION_UNKNOWN
+      Note over Disp,DB: Reconcile available provider evidence before applying retry policy
     end
   end
 
-  %% Phase 3: Webhook Reconciliation & Status Outbox
   rect rgb(255, 245, 245)
-    Note right of Webhook: 3. Webhook Reconciliation & Status Outbox
-    Vendor->>Webhook: POST /webhooks/mailjet (event_id, status)
-    Webhook->>DB: BEGIN TX: Insert raw event idempotently + update status ledger
-    Note over Webhook,DB: Ignore stale transitions - DELIVERED = vendor handoff confirmed
-    DB-->>Webhook: COMMIT TX
-    Webhook->>StatusStream: Status Outbox Relay publishes to Kafka at-least-once
+    Note over Vendor,StatusStream: Phase 3: Webhook reconciliation and status publishing
+
+    Vendor->>Webhook: POST /webhooks/mailjet
+    Webhook->>DB: Store event idempotently and update status
+    Note over Webhook,DB: Ignore duplicate or stale events; commit status and status outbox atomically
+    DB-->>Webhook: Commit successful
+    Status->>DB: Read unpublished status outbox rows
+    DB-->>Status: Committed status events
+    Status->>StatusStream: Publish status event at-least-once
+
+    Note over DB,StatusStream: DELIVERED means provider-reported delivery to the recipient mail server
   end
 ```
 
