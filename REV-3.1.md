@@ -312,82 +312,64 @@ flowchart LR
 ```
 ### 3.3 Key flows
 ```mermaid
-%%{init: {'theme': 'base', 'themeVariables': { 'fontSize': '15px' }}}%%
+%%{init: {'theme': 'base', 'themeVariables': { 'fontSize': '14px' }}}%%
 sequenceDiagram
   autonumber
   actor Producer as "Upstream Producer (OTP)"
   participant API as "Ingress & Rendering Engine"
-  participant Cust as "Customer API"
-  participant DB as "PostgreSQL (Messages & Outbox)"
-  participant Relay as "Outbox Relay"
+  participant DB as "PostgreSQL (DB & Outbox)"
   participant Disp as "Vendor Dispatcher"
   participant Vendor as "Mailjet Send API v3.1"
-  participant Webhook as "Webhook Receiver"
-  participant Recon as "Status Reconciler"
+  participant Webhook as "Webhook Receiver & Reconciler"
   participant StatusStream as "Kafka Status Stream"
 
-  %% Phase 1: Ingestion & Idempotency
+  %% Phase 1: Ingestion, Idempotency & Durable Ack
   rect rgb(240, 248, 255)
-    Note right of Producer: Phase 1: Ingestion & Idempotency Check
-    Producer->>API: POST /v1/notifications (OAuth2 token, Idempotency-Key, use_case, payload)
-    API->>DB: Query idempotency record (producer_id + idempotency_key)
-    Note right of API: Redis is optional cache - PostgreSQL is authoritative
-    alt Duplicate Request Detected
-      API-->>Producer: HTTP 202 Accepted (existing notification_id, skip reprocessing)
-    else New Request
-      Note over API: Proceed to profile resolution & validation
+    Note right of Producer: 1. Ingestion, Idempotency & Durable Ack
+    Producer->>API: POST /v1/notifications (Idempotency-Key, payload)
+    API->>DB: Atomic TX: Query idempotency record & unique constraint
+    alt Duplicate Key + Same Payload
+      DB-->>API: Existing notification record
+      API-->>Producer: HTTP 202 Accepted (return existing notification_id)
+    else Duplicate Key + Different Payload
+      DB-->>API: Payload mismatch
+      API-->>Producer: HTTP 409 Conflict
+    else Valid New Request
+      API->>API: Resolve locale & check translation coverage
+      alt Missing Translation (Legal/Financial)
+        API->>DB: Persist FAILED_CONTENT state & alert operator
+        API-->>Producer: HTTP 202 Accepted (notification_id, status: FAILED_CONTENT)
+      else Valid / Non-Legal Fallback
+        API->>DB: BEGIN TX: Insert message + idempotency record + outbox row
+        DB-->>API: COMMIT TX
+        API-->>Producer: HTTP 202 Accepted (notification_id)
+      end
     end
   end
 
-  %% Phase 2: Profile, Suppression & Rendering
-  rect rgb(250, 240, 230)
-    Note right of API: Phase 2: Profile, Suppression & Rendering
-    API->>Cust: GET /customers/{id}
-    Cust-->>API: Recipient profile (locale: 'de-DE', brand: 'OEM_A')
-    API->>DB: Check suppression list (blocklist / unsubscribe)
-    API->>API: Read active translations from Redis cache & check coverage
-    alt Translation missing AND legal/financial use case
-      API->>DB: Store message as FAILED_CONTENT & alert operator
-      API-->>Producer: HTTP 202 Accepted (notification_id, status: FAILED_CONTENT)
-      Note over API,DB: Flow halts until missing content is published & resolved
-    else Translation missing AND non-legal use case
-      API->>API: Fall back to OEM brand default language
-    else Translation present
-      API->>API: Apply 'de-DE' translation bundle
-    end
-    API->>API: Render HTML layout (MJML / Handlebars)
-  end
-
-  %% Phase 3: Transactional Outbox & Dispatch
+  %% Phase 2: Outbox Relay & Mailjet Dispatch
   rect rgb(240, 255, 240)
-    Note right of API: Phase 3: Outbox & Vendor Dispatch
-    API->>DB: BEGIN TX: Insert message + idempotency record + lane outbox row
-    DB-->>API: COMMIT TX
-    API-->>Producer: HTTP 202 Accepted (notification_id)
-    Relay->>DB: Poll unpublished outbox rows
-    Relay->>Disp: Publish message to Kafka urgent topic
-    Disp->>Disp: Consume token from urgent share of rate budget
-    Disp->>DB: Persist send attempt (ATTEMPTING, attempt_id, CustomID)
+    Note right of API: 2. Outbox Relay & Mailjet Dispatch
+    API->>Disp: Outbox Relay reads outbox & dispatches via Kafka
+    Disp->>DB: Persist attempt state (ATTEMPTING, attempt_id)
     Disp->>Vendor: POST /v3.1/send (payload, CustomID = notification_id)
-    alt Definitive success response (HTTP 200)
-      Vendor-->>Disp: HTTP 200 OK (Mailjet MessageID)
-      Disp->>DB: UPDATE status = PROVIDER_ACCEPTED, vendor_message_id
-    else Timeout / Ambiguous HTTP 5xx
+    alt Success (HTTP 200)
+      Vendor-->>Disp: HTTP 200 OK (vendor_message_id)
+      Disp->>DB: UPDATE status = PROVIDER_ACCEPTED
+    else Timeout / Ambiguous 5xx
       Disp->>DB: UPDATE status = SUBMISSION_UNKNOWN
-      Note over Disp,DB: Reconcile via webhooks - do not blindly retry to avoid duplicates
+      Note over Disp,DB: Bounded retries - reconcile via webhooks (prevents duplicate sends)
     end
   end
 
-  %% Phase 4: Webhook Feedback & Status Reconciliation
+  %% Phase 3: Webhook Reconciliation & Status Outbox
   rect rgb(255, 245, 245)
-    Note right of Webhook: Phase 4: Webhook Feedback & Status Stream
-    Vendor->>Webhook: POST /webhooks/mailjet (basic auth, event: sent / delivered / bounce)
-    Webhook->>DB: INSERT raw event idempotently (MessageID / CustomID + event_id)
-    Webhook-->>Vendor: HTTP 200 OK
-    Recon->>DB: BEGIN TX: Correlate event, update status ledger, insert status-outbox row
-    DB-->>Recon: COMMIT TX
-    Recon->>StatusStream: Status-outbox relay publishes event at-least-once
-    Note over Recon,StatusStream: Downstream consumers deduplicate using stable event_id
+    Note right of Webhook: 3. Webhook Reconciliation & Status Outbox
+    Vendor->>Webhook: POST /webhooks/mailjet (event_id, status)
+    Webhook->>DB: BEGIN TX: Insert raw event idempotently + update status ledger
+    Note over Webhook,DB: Ignore stale transitions - DELIVERED = vendor handoff confirmed
+    DB-->>Webhook: COMMIT TX
+    Webhook->>StatusStream: Status Outbox Relay publishes to Kafka at-least-once
   end
 ```
 ## 4. Key decisions
