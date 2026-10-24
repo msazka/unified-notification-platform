@@ -389,7 +389,7 @@ sequenceDiagram
     Recon->>StatusStream: Status-outbox relay publishes event at-least-once
     Note over Recon,StatusStream: Downstream consumers deduplicate using stable event_id
   end
-
+```
 ## 4. Key decisions
 Eight decisions, each with the alternative I rejected. #8 is a decision *not* to add something.
 
