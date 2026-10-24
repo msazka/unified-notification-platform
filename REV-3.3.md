@@ -3,11 +3,11 @@ Read time: ~10–15 min
 
 #### TL;DR
 * **Problem**: DCS operates four overlapping, fragmented legacy notification systems (System 1 .NET Functions, System 2 Quarkus REST, System 3 Fastify Campaign Engine, System 4 Windows BIRT Engine capped at ~3,080 msgs/hr) sharing uncoordinated Mailjet and Lokalise accounts bounded by a strict 6 req/s token cap.
-* **Proposal**: Build a single, high-throughput Unified Notification Platform providing dual-priority queueing, async Redis translation caching, transactional outbox pattern, and event-driven Mailjet webhook reconciliation.
+* **Proposal**: Build a single, high-throughput Unified Notification Platform providing three priority lanes (urgent, transactional, bulk), async Redis translation caching, transactional outbox pattern, and event-driven Mailjet webhook reconciliation.
 * **Key Decisions**:
   1. *Durable Ingestion*: PostgreSQL transactions and an outbox support reliable, at-least-once dispatch processing; they do not guarantee final email delivery.
   2. *Localization*: A rate-limited background sync and Redis cache keep Lokalise calls off the request hot path. Missing required legal content blocks dispatch.
-  3. *Priority Isolation*: Separate Kafka topics and reserved dispatcher capacity protect urgent traffic from bulk queue backlog, subject to shared Mailjet limits.
+  3. *Priority Isolation*: Three Kafka lanes (urgent, transactional, bulk) with reserved dispatcher capacity keep OTPs from waiting behind billing runs or campaigns, subject to shared Mailjet limits.
   4. *Storage & Audit*: PostgreSQL stores notification metadata and status; object storage holds rendered snapshots under a defined retention policy.
   5. *Domain Boundary*: Billing owns financial document generation; the Notification Platform owns message orchestration and delivery.
 * **Migration Plan**: Incremental Strangler Fig pattern across 4 phases, starting with Phase 0 shadow testing, migrating System 4 by consuming the existing `mail_document` Kafka stream in Phase 2, and concluding with full legacy decommissioning.
@@ -43,7 +43,7 @@ These systems were built by different teams at different times. They do overlapp
 * **In-Scope (Notification Platform Domain)**:
   * Unified REST ingress API & Kafka event consumers.
   * Template wrapper compilation (MJML/Handlebars), dynamic multi-OEM brand injection, and pre-send locale coverage validation.
-  * Dual-priority queueing and vendor adapter dispatch to Mailjet Send v3.1.
+  * Three-lane priority queueing (urgent, transactional, bulk) and vendor adapter dispatch to Mailjet Send v3.1.
   * Mailjet webhook ingestion, ACID status ledger updates in PostgreSQL, and publishing downstream events to Kafka Status Stream.
   * Pluggable multi-channel architecture (Push/SMS).
 * **Out-of-Scope (Non-Goals)**:
@@ -59,7 +59,7 @@ These systems were built by different teams at different times. They do overlapp
 | # | Category | Assumption & Technical Baseline | Architectural Impact |
 |---|---|---|---|
 | A1 | **Throughput & Capacity** | Assumed peak transactional ingress is **500 requests/sec** and bulk enqueue throughput is **2,000 recipients/sec**. | Durable buffering and independent worker scaling; actual dispatch capacity depends on Mailjet limits. |
-| A2 | **Latency & Campaign SLA** | Target high-priority P99 is **under 2 seconds to provider dispatch attempt**. A 15-minute campaign SLA depends on verified provider capacity. | Separate priority lanes and reserved dispatch capacity; validate targets with load tests. |
+| A2 | **Latency & Campaign SLA** | Targets per lane: **urgent** (OTPs, verification codes) P99 **under 2 seconds** to provider dispatch attempt; **transactional** (dunning, receipts, card orders, price updates) P99 **under 5 minutes**. A 15-minute campaign SLA depends on verified provider capacity. | Three lanes with reserved dispatch capacity per lane; validate targets with load tests. |
 | A3 | **Vendor Constraints** | Lokalise API enforces a strict rate cap of **6 req/sec per token**. Mailjet operates via Send v3.1 REST API & Webhooks. | Prohibits live Lokalise REST calls on rendering hot-paths; requires async Redis caching. |
 | A4 | **Ecosystem Capabilities** | A Customer/Identity API resolves recipient contact details and locale. An existing Kafka topic carries legacy `mail_document` change events. | Allows Phase 2 migration to consume the existing event stream directly without building new CDC tooling. |
 | A5 | **Audit & Retention** | Rendered snapshots are retained for 30 days as a provisional assumption; operational-record PII anonymisation after 90 days is a separate policy requiring approval. | Store snapshots in object storage and apply separately managed lifecycle policies. |
@@ -83,7 +83,7 @@ These systems were built by different teams at different times. They do overlapp
 
 ##### Non-Functional Requirements
 * **Resiliency & Circuit Breaking**: Maintain 99.9% availability with automated circuit breakers and durable Kafka buffering during Mailjet outages.
-* **SLA Protection**: Reduce head-of-line blocking through separate priority topics and reserved dispatch capacity; actual latency depends on provider availability and rate limits.
+* **SLA Protection**: Reduce head-of-line blocking through separate topics per lane (urgent, transactional, bulk) and reserved dispatch capacity per lane; actual latency depends on provider availability and rate limits.
 * **Audit Compliance**: Persist immutable rendered message snapshots in cheap object storage with automated lifecycle retention policies (30 days, provisional — see A5).
 * **Observability**: Propagate distributed correlation IDs across REST ingress, Kafka queues, template compilers, and webhook reconcilers for end-to-end tracing.
 
@@ -180,9 +180,10 @@ flowchart LR
 
     subgraph Dispatch ["5. Queueing and Dispatch"]
       outboxRelay["Dispatch Outbox Relay<br/>Publishes committed outbox events"]
-      highPriorityQ[("High-Priority Kafka Topic<br/>OTPs and urgent notifications")]
+      highPriorityQ[("Urgent Kafka Topic<br/>OTPs and verification codes")]
+      txQ[("Transactional Kafka Topic<br/>Dunning, receipts, card orders")]
       lowPriorityQ[("Bulk Kafka Topic<br/>Campaign recipients")]
-      dispatcher["Vendor Dispatcher<br/>Mailjet adapter, global rate limit,<br/>reserved urgent capacity and retries"]
+      dispatcher["Vendor Dispatcher<br/>Mailjet adapter, global rate limit,<br/>reserved capacity per lane and retries"]
     end
 
     subgraph Feedback ["6. Status Reconciliation"]
@@ -218,10 +219,12 @@ flowchart LR
 
   processor -->|"Commit notification and dispatch outbox"| postgres
   postgres -->|"Committed outbox rows"| outboxRelay
-  outboxRelay -->|"Route by priority"| highPriorityQ
-  outboxRelay -->|"Route by priority"| lowPriorityQ
+  outboxRelay -->|"Route by lane"| highPriorityQ
+  outboxRelay -->|"Route by lane"| txQ
+  outboxRelay -->|"Route by lane"| lowPriorityQ
 
   highPriorityQ -->|"Consume urgent messages"| dispatcher
+  txQ -->|"Consume transactional messages"| dispatcher
   lowPriorityQ -->|"Consume bulk messages"| dispatcher
   dispatcher -->|"Rate-limited send attempt"| mailjetApi
 
@@ -239,7 +242,7 @@ flowchart LR
 
   class restClients,kafkaProducer,adminUI producerStyle;
   class restApi,kafkaConsumer,campaignApi,processor,templateEngine,lokaliseSync,outboxRelay,dispatcher,webhookHandler,statusReconciler,statusOutboxRelay containerStyle;
-  class highPriorityQ,lowPriorityQ queueStyle;
+  class highPriorityQ,txQ,lowPriorityQ queueStyle;
   class postgres,redis,snapshots,kafkaStatusStream dbStyle;
   class customerApi,lokaliseApi,mailjetApi extStyle;
 ```
@@ -333,7 +336,7 @@ sequenceDiagram
 |---|---|---|---|---|
 | 1 | **Ingestion Pattern** | Transactional Outbox + Kafka | Synchronous Vendor Calls | Decouples request acceptance from vendor availability and supports durable, at-least-once processing with retryable event publication. |
 | 2 | **Localization** | Local Redis Cache + Strict Pre-Send Validation | Live Lokalise REST API & Silent English Fallback | Satisfies Lokalise's strict 6 req/s token cap while preventing illegal/non-compliant English fallbacks on German legal dunning notices. |
-| 3 | **Queueing** | Separate Kafka topics for urgent and bulk traffic, with reserved dispatcher capacity | One shared FIFO queue | Reduces cross-lane head-of-line blocking. Both lanes still share Mailjet limits, so the dispatcher must enforce a global rate limit and reserve capacity for urgent traffic. |
+| 3 | **Queueing** | Three Kafka topics by lane (urgent, transactional, bulk), with a global rate limit and reserved dispatcher capacity per lane | One shared FIFO queue; or two lanes with dunning in the urgent lane | A billing run can produce thousands of dunning notices at once; in a shared or two-lane setup they would sit in front of OTPs. Separate topics stop queue backlog, but all lanes still share Mailjet's limit, so the reserved capacity per lane is the actual guarantee. |
 | 4 | **Metadata Store** | PostgreSQL + JSONB | NoSQL Document Store | Guarantees transactional ACID safety for delivery status state transitions while storing flexible template payload variables in JSONB. |
 | 5 | **Snapshot Storage** | S3 / Azure Blob Storage | PostgreSQL Blob Columns | Offloads large rendered HTML/PDF payloads to cheap object storage, preventing database bloat; lifecycle rules apply the retention policy (30 days, provisional — A5). |
 | 6 | **Template Engine** | Server-Side MJML / Handlebars Compiler | Mailjet Hosted Templates | Provides Git version control, multi-OEM branding isolation, zero vendor lock-in, and local pre-send coverage checks. |
@@ -406,7 +409,7 @@ To address the highest-risk execution path, the platform implements four critica
 * **Baseline**: System 4 currently caps sends at ~3,080 emails/hr via manual SQL triggers on `oi_mail_document`.
 * **Key Actions**:
   1. Subscribe the Unified Platform's Kafka Consumer directly to the **existing `mail_document` Kafka change-event stream** (which dunning migrations already use).
-  2. Map incoming `mail_document` event payloads (dunning notices, order confirmations) directly into the **High-Priority Transactional Pipeline**.
+  2. Map incoming `mail_document` event payloads (dunning notices, order confirmations) into the **transactional lane** (P99 under 5 minutes), so billing runs never delay OTPs.
   3. Render localized notification wrappers around pre-generated billing attachments (from Billing Domain) and dispatch via Mailjet.
   4. Decommission the legacy Windows VM, BIRT engine, and manual Perl/SSH content sync scripts.
 
