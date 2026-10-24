@@ -23,12 +23,21 @@ Digital Charging Solutions (DCS) powers EV charging communications across multip
 
 These systems share two fragile downstream dependencies: a single shared **Mailjet** account and a **Lokalise** translation instance bounded by a strict rate limit of **6 req/sec per token**. Uncoordinated traffic bursts risk hitting rate limits, causing message dropouts, and propagating vendor latency directly to core user flows.
 
-##### Grouped Issues
-* **Reliability & Auditing**: System 1 uses fire-and-forget HTTP calls without DB logging, leading to untraceable lost messages during vendor glitches.
-* **Vendor Risk & Rate Limits**: Live hot-path calls to Lokalise risk hitting the 6 req/s token cap, causing rendering failures during traffic spikes.
-* **Performance Bottlenecks**: System 4 BIRT engine SQL polling caps sends at ~0.85 msgs/sec, delaying critical billing communications.
-* **SLA Protection**: Lack of priority queueing allows massive marketing campaigns to block urgent OTPs and legal dunning notices.
-* **Compliance & Content Drift**: Silent English fallbacks in System 1 produce non-compliant English dunning notices for German drivers, exposing the business to regulatory risk.
+These systems were built by different teams at different times. They do overlapping jobs, but each one stores data, retries and reports status in its own way, and all four depend on the same Mailjet account and the same Lokalise instance through four different integrations.
+
+##### Problems this setup creates
+* **Content drift:** Lokalise content reaches customers four ways: compiled into Mailjet-hosted templates at build time (System 1), merged at render time (System 2), rendered from MJML (System 3), and copied into billing tables by hand over SSH (System 4). The same notice can differ depending on which system sends it, and a stale copy goes unnoticed. Only System 3 checks before sending that content exists for each recipient's locale; System 1 silently falls back to English legal PDFs when a language file is missing.
+* **No reliable delivery, no single status:** System 1 is fire-and-forget with no retry, so a Mailjet error loses the email silently; System 4's only retry is re-inserting the row. Status is tracked three different ways (System 2 via webhooks and Service Bus, System 3 by polling, Systems 1 and 4 not at all), so nobody can answer "did customer X receive notice Y?" in one place.
+* **One Mailjet account, no coordination:** all four systems share one account's sending limits and one sender reputation. A campaign with high bounce or complaint rates can hurt the deliverability of OTPs and receipts for every OEM. Credentials are spread across four codebases, and four consumers share Lokalise's per-token rate limit.
+* **Compliance gaps:** System 4 test sends use real customer data. Systems 1 and 4 keep no audit trail, so there is no proof that a dunning or legal notice was sent, or what it said. Retention and anonymisation exist only in System 3.
+* **Operational and people risk (System 4):** BIRT runs on a Windows VM near end of life, with no repo and a single expert. Sends run hourly and are capped at ~3,080/hour. Bulk sends are a manual SQL-and-preview ritual, and manual INT→PROD promotion has already shipped broken banners.
+* **Every change costs up to four times:** a new OEM or use case may need work in .NET, Kotlin, Node and BIRT, and an improvement in one system (retries, validation, status) doesn't help the others.
+
+##### Severity
+* **Most severe: legal and financial notices** (dunning, price-update and contractual notices). Wrong language or content, or no proof of sending, is a legal risk rather than a cosmetic one, and today it can happen silently.
+* **Widest blast radius: the shared Mailjet account.** One bad campaign can affect transactional email for every brand.
+* **Most urgent: System 4,** though migration is already under way (dunning now reads change events from Kafka).
+* **Why patching each system doesn't scale:** every fix has to be built up to four times.
 
 ##### Scope and Non-Goals
 * **In-Scope (Notification Platform Domain)**:
