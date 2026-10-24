@@ -176,7 +176,7 @@ flowchart LR
 
     subgraph Storage ["4. Durable Storage"]
       postgres[("PostgreSQL<br/>Notifications, idempotency,<br/>dispatch outbox and status ledger")]
-      snapshots[("S3 / Azure Blob Storage<br/>Rendered content snapshots")]
+      snapshots[("Azure Blob Storage<br/>Rendered content snapshots")]
     end
 
     subgraph Dispatch ["5. Queueing and Dispatch"]
@@ -339,10 +339,10 @@ sequenceDiagram
 | 1 | **Ingestion Pattern** | Transactional Outbox + Kafka | Synchronous Vendor Calls | Decouples request acceptance from vendor availability and supports durable, at-least-once processing with retryable event publication. |
 | 2 | **Localization** | Local Redis Cache + Strict Pre-Send Validation | Live Lokalise REST API & Silent English Fallback | Satisfies Lokalise's strict 6 req/s token cap while preventing illegal/non-compliant English fallbacks on German legal dunning notices. |
 | 3 | **Queueing** | Three Kafka topics by lane (urgent, transactional, bulk), with a global rate limit and reserved dispatcher capacity per lane | One shared FIFO queue; or two lanes with dunning in the urgent lane | A billing run can produce thousands of dunning notices at once; in a shared or two-lane setup they would sit in front of OTPs. Separate topics stop queue backlog, but all lanes still share Mailjet's limit, so the reserved capacity per lane is the actual guarantee. |
-| 4 | **Metadata Store** | PostgreSQL + JSONB | NoSQL Document Store | Guarantees transactional ACID safety for delivery status state transitions while storing flexible template payload variables in JSONB. |
-| 5 | **Snapshot Storage** | S3 / Azure Blob Storage | PostgreSQL Blob Columns | Offloads large rendered HTML/PDF payloads to cheap object storage, preventing database bloat; lifecycle rules apply the retention policy (30 days, provisional — A5). |
+| 4 | **Storage** | PostgreSQL for notifications, outbox and status (JSONB for template variables) + Azure Blob Storage for rendered snapshots | NoSQL document store; snapshots as PostgreSQL blobs | The outbox needs the notification and outbox row in one ACID transaction, and status transitions need conditional updates. Large HTML/PDF snapshots would bloat the database and backups; Blob lifecycle rules apply the retention policy (30 days, provisional — A5). Azure because DCS already runs on it (System 1 Functions, System 2 Service Bus). |
+| 5 | **Platform foundation** | New platform built on System 2's stack (Quarkus/Kotlin, PostgreSQL), keeping its use-case API (`/email/use-cases/{useCase}`) as the ingress contract and porting its webhook mapping and blocklist logic | Extending System 2 in place; or a greenfield platform on a new stack | System 2 is closest to the target, so its stack and API contract are reused. But it has no lanes, outbox or campaigns and is tied to Service Bus and JobRunr; reworking it while it serves live traffic is riskier than replacing it use case by use case. |
 | 6 | **Template Engine** | Server-Side MJML / Handlebars Compiler | Mailjet Hosted Templates | Provides Git version control, multi-OEM branding isolation, zero vendor lock-in, and local pre-send coverage checks. |
-| 7 | **Delivery Tracking** | Webhook Ingestion + Kafka Status Stream | Active Vendor API Polling | Provides real-time event-driven delivery feedback downstream without wasting bandwidth or hitting Mailjet polling rate limits. |
+| 8 | **Not a second queue technology** | Kafka for all three lanes, including bulk | Redis + BullMQ for bulk (as System 3 uses) | One broker for a small team to run; Kafka already exists at DCS and is durable. Cost: no native delay or cancel, so the Campaign Service paces batches into the bulk topic and the dispatcher checks campaign state before sending (handles cancel). |
 
 ---
 
@@ -360,7 +360,7 @@ sequenceDiagram
 
 ##### Idempotency & Retention
 * **Idempotency**: PostgreSQL is authoritative, using a unique constraint on `(producer_id, idempotency_key)`. The same key and payload return the existing `notification_id`; the same key with a different payload returns HTTP 409. Redis may accelerate lookups but is not the source of truth.
-* **Data Lifecycle & GDPR**: Rendered HTML/PDF audit snapshots in S3 automatically expire after 30 days via S3 Lifecycle rules. PII fields in PostgreSQL status logs are anonymized via background cleanup jobs after 90 days.
+* **Data Lifecycle & GDPR**: Rendered HTML/PDF audit snapshots in Azure Blob Storage expire after 30 days (provisional, A5) via Blob lifecycle rules. PII fields in PostgreSQL status logs are anonymized via background cleanup jobs after 90 days.
 
 ---
 
@@ -414,10 +414,11 @@ To address the highest-risk execution path, the platform implements four critica
   2. Map incoming `mail_document` event payloads (dunning notices, order confirmations) into the **transactional lane** (P99 under 5 minutes), so billing runs never delay OTPs.
   3. Render localized notification wrappers around pre-generated billing attachments (from Billing Domain) and dispatch via Mailjet.
   4. Decommission the legacy Windows VM, BIRT engine, and manual Perl/SSH content sync scripts.
-
+  5. 
 ###### Phase 3: Migrate System 2 (Quarkus REST) & System 3 (Campaign Engine)
+* **Why last?**: Both already have retries and audit (System 2) or pre-send validation and snapshots (System 3), so they carry the lowest risk today. Their strongest features are what the platform is built from (Decision 5).
 * **Key Actions**:
-  1. Reroute remaining synchronous REST endpoints from System 2 to the Unified REST Ingress API.
+  1. Reroute System 2's callers to the platform's REST API, which keeps System 2's use-case contract, so callers change little.
   2. Point the Campaign Admin UI (System 3) to the unified Campaign API, which publishes recipient batches to the Bulk Kafka Topic.
   3. Migrate historical delivery tracking tables and active subscriber lists to the unified PostgreSQL database.
 
