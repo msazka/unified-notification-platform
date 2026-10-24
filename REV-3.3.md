@@ -306,7 +306,7 @@ sequenceDiagram
 
     Vendor->>Webhook: POST /webhooks/mailjet
     Webhook->>DB: Store event idempotently and update status
-    Note over Webhook,DB: Ignore duplicate or stale events; commit status and status outbox atomically
+    Note over Webhook,DB: Ignore duplicate or stale events, commit status and status outbox atomically
     DB-->>Webhook: Commit successful
     Status->>DB: Read unpublished status outbox rows
     DB-->>Status: Committed status events
