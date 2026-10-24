@@ -312,27 +312,30 @@ flowchart LR
 ```
 ### 3.3 Key flows
 ```mermaid
+%%{init: {'theme': 'base', 'themeVariables': { 'fontSize': '15px' }}}%%
 sequenceDiagram
   autonumber
-  actor Producer as Upstream Producer (OTP)
-  participant API as Ingress and Rendering
-  participant Cust as Customer API
-  participant DB as PostgreSQL Messages and Outbox
-  participant Relay as Outbox Relay to Kafka urgent topic
-  participant Disp as Vendor Dispatcher
-  participant Vendor as Mailjet Send API v3.1
-  participant Webhook as Webhook Receiver
-  participant Recon as Status Reconciler
-  participant StatusStream as Kafka Status Stream
+  actor Producer as "Upstream Producer (OTP)"
+  participant API as "Ingress & Rendering Engine"
+  participant Cust as "Customer API"
+  participant DB as "PostgreSQL (Messages & Outbox)"
+  participant Relay as "Outbox Relay"
+  participant Disp as "Vendor Dispatcher"
+  participant Vendor as "Mailjet Send API v3.1"
+  participant Webhook as "Webhook Receiver"
+  participant Recon as "Status Reconciler"
+  participant StatusStream as "Kafka Status Stream"
 
   %% Phase 1: Ingestion & Idempotency
   rect rgb(240, 248, 255)
     note right of Producer: Phase 1: Ingestion & Idempotency Check
     Producer->>API: POST /v1/notifications (OAuth2 token, Idempotency-Key, use_case, payload)
-    API->>DB: INSERT idempotency record + message under unique (producer_id, key)
-    note right of API: Redis is optional cache only; PostgreSQL is authoritative
-    alt Duplicate request
-      API-->>Producer: HTTP 202 Accepted (same notification_id, nothing re-sent)
+    API->>DB: Query idempotency record (producer_id + idempotency_key)
+    note right of API: Redis is optional cache; PostgreSQL is authoritative
+    alt Duplicate Request Detected
+      API-->>Producer: HTTP 202 Accepted (existing notification_id, skip reprocessing)
+    else New Request
+      note over API: Proceed to profile resolution & validation
     end
   end
 
@@ -340,36 +343,38 @@ sequenceDiagram
   rect rgb(250, 240, 230)
     note right of API: Phase 2: Profile, Suppression & Rendering
     API->>Cust: GET /customers/{id}
-    Cust-->>API: Profile (locale: 'de-DE', brand: 'OEM_A')
-    API->>DB: Check suppression (blocklist / unsubscribe)
-    API->>API: Read active translations from optional cache, check coverage
+    Cust-->>API: Recipient profile (locale: 'de-DE', brand: 'OEM_A')
+    API->>DB: Check suppression list (blocklist / unsubscribe)
+    API->>API: Read active translations from Redis cache & check coverage
     alt Translation missing AND legal/financial use case
-      API->>DB: Store message as FAILED_CONTENT + alert operator
-      API-->>Producer: HTTP 202 Accepted (notification_id, status visible via status API)
-      note over API,DB: Flow stops here — not sent until content is fixed
-    else Translation missing, other use case
-      API->>API: Fall back to brand default language
+      API->>DB: Store message as FAILED_CONTENT & alert operator
+      API-->>Producer: HTTP 202 Accepted (notification_id, status: FAILED_CONTENT)
+      note over API,DB: Flow halts until missing content is published & resolved
+    else Translation missing AND non-legal use case
+      API->>API: Fall back to OEM brand default language
+    else Translation present
+      API->>API: Apply 'de-DE' translation bundle
     end
-    API->>API: Render HTML (MJML / Handlebars)
+    API->>API: Render HTML layout (MJML / Handlebars)
   end
 
   %% Phase 3: Transactional Outbox & Dispatch
   rect rgb(240, 255, 240)
     note right of API: Phase 3: Outbox & Vendor Dispatch
-    API->>DB: TX: insert message + ingress idempotency record + lane outbox row
-    DB-->>API: COMMIT
+    API->>DB: BEGIN TX: Insert message + idempotency record + lane outbox row
+    DB-->>API: COMMIT TX
     API-->>Producer: HTTP 202 Accepted (notification_id)
     Relay->>DB: Poll unpublished outbox rows
-    Relay->>Disp: Kafka urgent topic: message
-    Disp->>Disp: Take token from urgent share of rate budget
+    Relay->>Disp: Publish message to Kafka urgent topic
+    Disp->>Disp: Consume token from urgent share of rate budget
     Disp->>DB: Persist send attempt (ATTEMPTING, attempt_id, CustomID)
     Disp->>Vendor: POST /v3.1/send (payload, CustomID = notification_id)
-    alt Definitive success response
-      Vendor-->>Disp: HTTP 200 (Mailjet MessageID)
-      Disp->>DB: Record MessageID; status = PROVIDER_ACCEPTED
-    else Timeout / ambiguous response
-      Disp->>DB: Mark attempt SUBMISSION_UNKNOWN
-      note over Disp,DB: Reconcile using webhook/provider evidence; do not assume failure just because no event arrived
+    alt Definitive success response (HTTP 200)
+      Vendor-->>Disp: HTTP 200 OK (Mailjet MessageID)
+      Disp->>DB: UPDATE status = PROVIDER_ACCEPTED, vendor_message_id
+    else Timeout / Ambiguous HTTP 5xx
+      Disp->>DB: UPDATE status = SUBMISSION_UNKNOWN
+      note over Disp,DB: Reconcile via webhooks; do not blindly retry to avoid duplicate sends
     end
   end
 
@@ -377,13 +382,13 @@ sequenceDiagram
   rect rgb(255, 245, 245)
     note right of Webhook: Phase 4: Webhook Feedback & Status Stream
     Vendor->>Webhook: POST /webhooks/mailjet (basic auth, event: sent / delivered / bounce)
-    Webhook->>DB: Insert raw event idempotently (MessageID / CustomID + event identity)
-    Webhook-->>Vendor: HTTP 200
-    Recon->>DB: TX: correlate event, reconcile status, insert status-outbox row
-    Recon->>StatusStream: Status-outbox relay publishes at-least-once
-    note over Recon,StatusStream: Downstream consumers deduplicate by stable event ID
+    Webhook->>DB: INSERT raw event idempotently (MessageID / CustomID + event_id)
+    Webhook-->>Vendor: HTTP 200 OK
+    Recon->>DB: BEGIN TX: Correlate event, update status ledger, insert status-outbox row
+    DB-->>Recon: COMMIT TX
+    Recon->>StatusStream: Status-outbox relay publishes event at-least-once
+    note over Recon,StatusStream: Downstream consumers deduplicate using stable event_id
   end
-```
 
 ## 4. Key decisions
 Eight decisions, each with the alternative I rejected. #8 is a decision *not* to add something.
