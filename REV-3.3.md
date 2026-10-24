@@ -58,17 +58,18 @@ These systems were built by different teams at different times. They do overlapp
 
 | # | Category | Assumption & Technical Baseline | Architectural Impact |
 |---|---|---|---|
-| A1 | **Throughput & Capacity** | Assumed peak transactional ingress is **500 requests/sec** and bulk enqueue throughput is **2,000 recipients/sec**. | Durable buffering and independent worker scaling; actual dispatch capacity depends on Mailjet limits. |
-| A2 | **Latency & Campaign SLA** | Targets per lane: **urgent** (OTPs, verification codes) P99 **under 2 seconds** to provider dispatch attempt; **transactional** (dunning, receipts, card orders, price updates) P99 **under 5 minutes**. A 15-minute campaign SLA depends on verified provider capacity. | Three lanes with reserved dispatch capacity per lane; validate targets with load tests. |
-| A3 | **Vendor Constraints** | Lokalise API enforces a strict rate cap of **6 req/sec per token**. Mailjet operates via Send v3.1 REST API & Webhooks. | Prohibits live Lokalise REST calls on rendering hot-paths; requires async Redis caching. |
+| A1 | **Throughput & Capacity** | ~2M customers × ~10 transactional messages/month ≈ 20M/month ≈ **8 msg/s average**; peak ×10 ≈ **80 msg/s**. Design target: **300 msg/s** transactional (headroom for new OEMs and billing-run bursts). Largest campaign: **2M recipients**. | Sizes workers, topic partitions and Customer API load; actual send capacity is bounded by the Mailjet plan (Q1). |
+| A2 | **Latency & Campaign SLA** |**Latency & Campaign SLA** | Targets per lane: **urgent** (OTPs, verification codes) P99 **under 2 seconds** to provider dispatch attempt; **transactional** (dunning, receipts, card orders, price updates) P99 **under 5 minutes**; **bulk**: a 2M-recipient campaign completes within **4 hours**. | Three lanes with reserved dispatch capacity per lane; bulk is throttled, not sent as fast as possible; validate with load tests. |
+| A3 | **Vendor Constraints** | **Lokalise:** 6 req/sec per API token and per IP; 10 concurrent requests per project; synchronous file download limited to 10,000 key-language pairs (async export above that); webhooks on translation/key changes. **Mailjet:** rate-limited per API key per second (exact limit not published; HTTP 429 when exceeded); Send API v3.1 accepts up to 50 messages per call; Mailjet recommends separate sub-accounts for separate applications. | No live Lokalise calls on the rendering hot path: a single sync worker, triggered by Lokalise webhooks plus a scheduled full sync, uses async export. Dispatcher batches bulk sends, backs off on 429, and can use separate sub-accounts/keys for bulk vs transactional (Q1). |
 | A4 | **Ecosystem Capabilities** | A Customer/Identity API resolves recipient contact details and locale. An existing Kafka topic carries legacy `mail_document` change events. | Allows Phase 2 migration to consume the existing event stream directly without building new CDC tooling. |
 | A5 | **Audit & Retention** | Rendered snapshots are retained for 30 days as a provisional assumption; operational-record PII anonymisation after 90 days is a separate policy requiring approval. | Store snapshots in object storage and apply separately managed lifecycle policies. |
 
-**Capacity check:** A 2-million-recipient campaign needs ~2,223 sends/sec to finish in 15 minutes; at 2,000/sec, dispatch takes ~16 minutes 40 seconds, excluding overhead and retries.
+**Capacity check:** a 2M-recipient campaign in 4 hours needs ~140 msg/s, only ~3 Send API calls/s at 50 messages per call. With the 300 msg/s transactional target, the platform needs Mailjet to accept **~440 msg/s at peak**. That number, not API call rate, is what to confirm with Mailjet (Q1).
 
 ##### Open Questions
-1. What are Mailjet's actual throughput limits, and what evidence or mechanism is available to reconcile ambiguous send outcomes?
+1. What sending volume and per-key rate limit does DCS's Mailjet plan allow (we need ~440 msg/s at peak), and can bulk and transactional traffic use separate sub-accounts to protect sender reputation?
 2. What are the agreed latency/SLA definitions and approved retention requirements for notification content and delivery records?
+3. Does DCS's Lokalise plan include webhooks? If not, sync falls back to scheduled polling, and content changes take longer to reach the platform.
 
 ---
 
@@ -169,7 +170,7 @@ flowchart LR
     end
 
     subgraph Localization ["3. Localization"]
-      lokaliseSync["Rate-Limited Sync Worker<br/>Maximum 6 requests/sec per token"]
+      lokaliseSync["Lokalise Sync Worker<br/>Webhook-triggered + scheduled,<br/>async export, max 6 req/s"]
       redis[("Redis<br/>Translation cache and optional lookup cache")]
     end
 
@@ -214,7 +215,8 @@ flowchart LR
   templateEngine -->|"Read cached translations"| redis
   templateEngine -->|"Save rendered snapshot"| snapshots
 
-  lokaliseSync -->|"Rate-limited async sync"| lokaliseApi
+  lokaliseApi -->|"Webhook: translations/keys changed"| lokaliseSync
+  lokaliseSync -->|"Rate-limited async export"| lokaliseApi
   lokaliseSync -->|"Refresh translation cache"| redis
 
   processor -->|"Commit notification and dispatch outbox"| postgres
