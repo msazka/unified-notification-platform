@@ -69,13 +69,13 @@ These systems share two fragile downstream dependencies: a single shared **Mailj
 * **Unified Ingress**: Provide REST endpoints for real-time transactional requests (OTPs, card orders) and Kafka event consumers for domain triggers (dunning, billing updates).
 * **Idempotency & Deduplication**: Enforce a 24-hour client idempotency window using `Idempotency-Key` and an authoritative PostgreSQL unique constraint on `(producer_id, idempotency_key)`. Redis is optional and must not be required for correctness.
 * **Multi-OEM Branding**: Dynamically inject OEM-specific layouts, assets, and per-OEM verified sender domains based on tenant context.
-* **Strict Localization Validation**: Intersect recipient preferred locales with local Redis translation coverage prior to dispatch. For legal/financial notices (dunning), missing translations must **block the send and route to a Dead-Letter Queue (DLQ)** with immediate alerting, rather than falling back silently to English.
+* **Strict Localization Validation**: Intersect recipient preferred locales with local Redis translation coverage prior to dispatch. For legal/financial notices (dunning), missing translations must **block the send**: the notification is persisted as `FAILED_CONTENT` with immediate operator alerting, rather than falling back silently to English.
 * **Status Reconciliation & Publishing**: Ingest Mailjet delivery, bounce, and open webhooks, update PostgreSQL status ledger, and publish standardized delivery events to a downstream Kafka status stream.
 
 ##### Non-Functional Requirements
 * **Resiliency & Circuit Breaking**: Maintain 99.9% availability with automated circuit breakers and durable Kafka buffering during Mailjet outages.
 * **SLA Protection**: Reduce head-of-line blocking through separate priority topics and reserved dispatch capacity; actual latency depends on provider availability and rate limits.
-* **Audit Compliance**: Persist immutable rendered message snapshots in cheap object storage with automated 30-day lifecycle retention policies.
+* **Audit Compliance**: Persist immutable rendered message snapshots in cheap object storage with automated lifecycle retention policies (30 days, provisional — see A5).
 * **Observability**: Propagate distributed correlation IDs across REST ingress, Kafka queues, template compilers, and webhook reconcilers for end-to-end tracing.
 
 ---
@@ -109,7 +109,6 @@ flowchart LR
     pushSms["Push / SMS Providers<br/>Future extension: FCM / Twilio"]
   end
 
-  driver <-->|"Receives notifications"| notificationSystem
   operator -->|"Manages campaigns and templates"| notificationSystem
 
   apiProducers -->|"REST requests"| notificationSystem
@@ -119,6 +118,7 @@ flowchart LR
   notificationSystem -->|"Syncs translations asynchronously"| lokalise
   notificationSystem -->|"Submits emails"| mailjet
   mailjet -->|"Delivery webhooks"| notificationSystem
+  mailjet -->|"Delivers email"| driver
   notificationSystem -->|"Future channel integration"| pushSms
 
   notificationSystem -->|"Publishes status events"| kafkaStatus
@@ -138,92 +138,90 @@ flowchart LR
 ##### 4.2 Containers (C4 L2)
 
 ```mermaid
-%%{init: {'theme': 'base', 'themeVariables': { 'fontSize': '16px', 'nodePadding': '12' }}}%%
+%%{init: {'theme': 'base', 'themeVariables': { 'fontSize': '14px', 'nodePadding': '10' }}}%%
 flowchart LR
-  %% C4 Level 2: Container Architecture Diagram (GitHub Native)
-
-  subgraph Producers ["Upstream Producers & Clients"]
-    restClients["<b>Synchronous Microservices</b><br/>(OTPs, Card Orders)"]
-    kafkaProducer[("<b>Kafka Event Stream</b><br/>(Billing, Dunning Events)")]
-    adminUI["<b>Campaign Admin UI</b><br/>(React / TypeScript)"]
+  subgraph Producers ["Upstream Producers and Clients"]
+    restClients["Synchronous Microservices<br/>OTPs and card orders"]
+    kafkaProducer[("Kafka Domain Events<br/>Billing and dunning")]
+    adminUI["Campaign Admin UI<br/>React / TypeScript"]
   end
 
-  subgraph PlatformBoundary ["Unified Notification Platform"]
+  subgraph Platform ["Unified Notification Platform"]
 
-    subgraph IngressLayer ["1. Ingress & Trigger Layer"]
-      restApi["<b>REST Ingress API</b><br/>(Quarkus / Kotlin)<br/>Low-latency sync endpoint"]
-      kafkaConsumer["<b>Kafka Event Consumer</b><br/>(Quarkus / Kotlin)<br/>Asynchronous event listener"]
-      campaignApi["<b>Campaign Service</b><br/>(Node / Fastify)<br/>Batching & cohort scheduling"]
+    subgraph Ingress ["1. Ingress and Trigger Layer"]
+      restApi["REST Ingress API<br/>Quarkus / Kotlin"]
+      kafkaConsumer["Kafka Event Consumer<br/>Quarkus / Kotlin"]
+      campaignApi["Campaign Service<br/>Campaign scheduling and batching"]
     end
 
-    subgraph ProcessingLayer ["2. Processing & Validation Engine"]
-      processor["<b>Core Processing Engine</b><br/>- Idempotency & Dedup Check<br/>- Profile & Locale Resolution<br/>- Strict Pre-Send Coverage Check"]
+    subgraph Processing ["2. Processing and Validation"]
+      processor["Core Processing Engine<br/>Idempotency, profile resolution,<br/>locale and content validation"]
+      templateEngine["MJML / Handlebars Renderer<br/>HTML and OEM branding"]
     end
 
-    subgraph LocalizationLayer ["3. Localization & Template Engine"]
-      templateEngine["<b>MJML/Handlebars Compiler</b><br/>Compiles HTML & brand layouts"]
-      lokaliseSync["<b>Lokalise Sync Worker</b><br/>Async translation fetcher"]
+    subgraph Localization ["3. Localization"]
+      lokaliseSync["Rate-Limited Sync Worker<br/>Maximum 6 requests/sec per token"]
+      redis[("Redis<br/>Translation cache and optional lookup cache")]
     end
 
-    subgraph QueueLayer ["4. Dual-Priority Queueing & Dispatch"]
-      highPriorityQ[("<b>Urgent Queue</b><br/>Kafka Urgent Topic<br/>(OTPs, Dunning - < 2s SLA)")]
-      lowPriorityQ[("<b>Bulk Queue</b><br/>Kafka Bulk Topic<br/>(Bulk / Throttled Campaigns)")]
-      dispatcher["<b>Vendor Dispatcher</b><br/>Mailjet Send v3.1 Adapter<br/>(Rate limiting & retries)"]
+    subgraph Storage ["4. Durable Storage"]
+      postgres[("PostgreSQL<br/>Notifications, idempotency,<br/>dispatch outbox and status ledger")]
+      snapshots[("S3 / Azure Blob Storage<br/>Rendered content snapshots")]
     end
 
-    subgraph FeedbackLayer ["5. Status & Webhook Reconciliation"]
-      webhookHandler["<b>Webhook Receiver</b><br/>Ingests Mailjet events"]
-      statusPublisher["<b>Status Reconciler</b><br/>Updates DB & emits Kafka status"]
+    subgraph Dispatch ["5. Queueing and Dispatch"]
+      outboxRelay["Dispatch Outbox Relay<br/>Publishes committed outbox events"]
+      highPriorityQ[("High-Priority Kafka Topic<br/>OTPs and urgent notifications")]
+      lowPriorityQ[("Bulk Kafka Topic<br/>Campaign recipients")]
+      dispatcher["Vendor Dispatcher<br/>Mailjet adapter, global rate limit,<br/>reserved urgent capacity and retries"]
     end
 
-    subgraph StorageLayer ["6. Storage Layer"]
-      postgres[("<b>PostgreSQL DB</b><br/>Metadata, outbox, status ledger")]
-      redis[("<b>Redis Datastore</b><br/>Idempotency keys cache, Lokalise cache")]
-      s3Store[("<b>S3 / Azure Blob Storage</b><br/>Rendered HTML/PDF audit snapshots")]
+    subgraph Feedback ["6. Status Reconciliation"]
+      webhookHandler["Webhook Receiver<br/>Validates Mailjet events"]
+      statusReconciler["Status Reconciler<br/>Deduplicates events and updates status"]
+      statusOutboxRelay["Status Outbox Relay<br/>Publishes committed status events"]
     end
-
   end
 
-  subgraph SharedServices ["External Vendors & Shared Ecosystem"]
-    customerApi["<b>Customer / Identity API</b>"]
-    lokaliseApi["<b>Lokalise API</b><br/>(6 req/s limit)"]
-    mailjetApi["<b>Mailjet Send API & Webhooks</b>"]
-    kafkaStatusStream[("<b>Kafka Status Stream</b>")]
+  subgraph Shared ["External Services"]
+    customerApi["Customer / Identity API"]
+    lokaliseApi["Lokalise API"]
+    mailjetApi["Mailjet Send API and Webhooks"]
+    kafkaStatusStream[("Kafka Status Stream")]
   end
 
-  %% Ingress Flows
-  restClients -->|"1a. HTTP POST"| restApi
-  kafkaProducer -->|"1b. Consume Event"| kafkaConsumer
-  adminUI -->|"1c. Schedule Campaign"| campaignApi
+  restClients -->|"HTTP POST"| restApi
+  kafkaProducer -->|"Domain events"| kafkaConsumer
+  adminUI -->|"Campaign commands"| campaignApi
 
-  restApi & kafkaConsumer & campaignApi -->|"2. Process Request"| processor
+  restApi --> processor
+  kafkaConsumer --> processor
+  campaignApi --> processor
 
-  %% Processing & Storage Interactions
-  processor <-->|"Idempotency & Cache"| redis
-  processor -->|"Write Outbox / Ledger"| postgres
-  processor -->|"Fetch Profile"| customerApi
+  processor -->|"Resolve recipient"| customerApi
+  processor -->|"Check translation coverage"| redis
+  processor -->|"Render message"| templateEngine
+  templateEngine -->|"Read cached translations"| redis
+  templateEngine -->|"Save rendered snapshot"| snapshots
 
-  %% Localization Flows
-  processor -->|"3. Render Template"| templateEngine
-  templateEngine <-->|"Read Translation Cache"| redis
-  lokaliseSync -->|"Async Sync (Bypasses Limit)"| lokaliseApi
-  lokaliseSync -->|"Populate Cache"| redis
+  lokaliseSync -->|"Rate-limited async sync"| lokaliseApi
+  lokaliseSync -->|"Refresh translation cache"| redis
 
-  %% Queueing & Dispatch Flows
-  templateEngine -->|"4a. Urgent Topic"| highPriorityQ
-  templateEngine -->|"4b. Bulk Topic"| lowPriorityQ
-  templateEngine -->|"Save Snapshot (30d)"| s3Store
+  processor -->|"Commit notification and dispatch outbox"| postgres
+  postgres -->|"Committed outbox rows"| outboxRelay
+  outboxRelay -->|"Route by priority"| highPriorityQ
+  outboxRelay -->|"Route by priority"| lowPriorityQ
 
-  highPriorityQ & lowPriorityQ -->|"5. Pull Jobs"| dispatcher
-  dispatcher -->|"6. Send Email Payload"| mailjetApi
+  highPriorityQ -->|"Consume urgent messages"| dispatcher
+  lowPriorityQ -->|"Consume bulk messages"| dispatcher
+  dispatcher -->|"Rate-limited send attempt"| mailjetApi
 
-  %% Webhook Feedback Loop
-  mailjetApi -->|"7. Webhook POST"| webhookHandler
-  webhookHandler -->|"8. Reconcile"| statusPublisher
-  statusPublisher -->|"Update Status"| postgres
-  statusPublisher -->|"Publish Event"| kafkaStatusStream
+  mailjetApi -->|"Webhook POST"| webhookHandler
+  webhookHandler -->|"Validate and reconcile"| statusReconciler
+  statusReconciler -->|"Update status and write status outbox"| postgres
+  postgres -->|"Committed status outbox rows"| statusOutboxRelay
+  statusOutboxRelay -->|"Publish at-least-once"| kafkaStatusStream
 
-  %% Styling
   classDef producerStyle fill:#084298,stroke:#084298,color:#fff;
   classDef containerStyle fill:#1168bd,stroke:#0b4884,color:#fff;
   classDef queueStyle fill:#d97706,stroke:#b45309,color:#fff;
@@ -231,10 +229,10 @@ flowchart LR
   classDef extStyle fill:#6c757d,stroke:#495057,color:#fff;
 
   class restClients,kafkaProducer,adminUI producerStyle;
-  class restApi,kafkaConsumer,campaignApi,processor,templateEngine,lokaliseSync,dispatcher,webhookHandler,statusPublisher containerStyle;
+  class restApi,kafkaConsumer,campaignApi,processor,templateEngine,lokaliseSync,outboxRelay,dispatcher,webhookHandler,statusReconciler,statusOutboxRelay containerStyle;
   class highPriorityQ,lowPriorityQ queueStyle;
-  class postgres,redis,s3Store dbStyle;
-  class customerApi,lokaliseApi,mailjetApi,kafkaStatusStream extStyle;
+  class postgres,redis,snapshots,kafkaStatusStream dbStyle;
+  class customerApi,lokaliseApi,mailjetApi extStyle;
 ```
 
 ##### 4.3 Key Flows (Sequence Diagram)
@@ -243,13 +241,13 @@ flowchart LR
 %%{init: {'theme': 'base', 'themeVariables': { 'fontSize': '14px' }}}%%
 sequenceDiagram
   autonumber
-  actor Producer as "Upstream Producer (OTP)"
-  participant API as "Ingress & Rendering Engine"
-  participant DB as "PostgreSQL (DB & Outbox)"
-  participant Disp as "Vendor Dispatcher"
-  participant Vendor as "Mailjet Send API v3.1"
-  participant Webhook as "Webhook Receiver & Reconciler"
-  participant StatusStream as "Kafka Status Stream"
+  actor Producer as Upstream Producer (OTP)
+  participant API as Ingress & Rendering Engine
+  participant DB as PostgreSQL (DB & Outbox)
+  participant Disp as Vendor Dispatcher
+  participant Vendor as Mailjet Send API v3.1
+  participant Webhook as Webhook Receiver & Reconciler
+  participant StatusStream as Kafka Status Stream
 
   %% Phase 1: Ingestion, Idempotency & Durable Ack
   rect rgb(240, 248, 255)
@@ -286,7 +284,7 @@ sequenceDiagram
       Disp->>DB: UPDATE status = PROVIDER_ACCEPTED
     else Timeout / Ambiguous 5xx
       Disp->>DB: UPDATE status = SUBMISSION_UNKNOWN
-      Note over Disp,DB: Bounded retries - reconcile via webhooks (prevents duplicate sends)
+      Note over Disp,DB: Bounded retries - reconcile via webhooks before retrying (reduces, but cannot eliminate, duplicate sends)
     end
   end
 
@@ -311,7 +309,7 @@ sequenceDiagram
 | 2 | **Localization** | Local Redis Cache + Strict Pre-Send Validation | Live Lokalise REST API & Silent English Fallback | Satisfies Lokalise's strict 6 req/s token cap while preventing illegal/non-compliant English fallbacks on German legal dunning notices. |
 | 3 | **Queueing** | Separate Kafka topics for urgent and bulk traffic, with reserved dispatcher capacity | One shared FIFO queue | Reduces cross-lane head-of-line blocking. Both lanes still share Mailjet limits, so the dispatcher must enforce a global rate limit and reserve capacity for urgent traffic. |
 | 4 | **Metadata Store** | PostgreSQL + JSONB | NoSQL Document Store | Guarantees transactional ACID safety for delivery status state transitions while storing flexible template payload variables in JSONB. |
-| 5 | **Snapshot Storage** | S3 / Azure Blob Storage | PostgreSQL Blob Columns | Offloads large rendered HTML/PDF payloads to cheap object storage, preventing database bloat while satisfying 30-day compliance audit retention. |
+| 5 | **Snapshot Storage** | S3 / Azure Blob Storage | PostgreSQL Blob Columns | Offloads large rendered HTML/PDF payloads to cheap object storage, preventing database bloat; lifecycle rules apply the retention policy (30 days, provisional — A5). |
 | 6 | **Template Engine** | Server-Side MJML / Handlebars Compiler | Mailjet Hosted Templates | Provides Git version control, multi-OEM branding isolation, zero vendor lock-in, and local pre-send coverage checks. |
 | 7 | **Delivery Tracking** | Webhook Ingestion + Kafka Status Stream | Active Vendor API Polling | Provides real-time event-driven delivery feedback downstream without wasting bandwidth or hitting Mailjet polling rate limits. |
 
@@ -364,11 +362,11 @@ To address the highest-risk execution path, the platform implements four critica
 
 ##### Phased Rollout Schedule
 
-###### Phase 0: Platform Foundation & Shadow Dual-Writing
+###### Phase 0: Platform Foundation & Shadow Traffic
 * **Goal**: Validate platform stability, template compilation, and vendor integrations in production without sending duplicate live emails.
 * **Key Actions**:
   1. Deploy core infrastructure (PostgreSQL, Redis, Kafka Ingress Consumers, Mailjet Adapter).
-  2. Implement **Shadow Dual-Writing**: Mirror a small percentage of live transactional triggers to the Unified Engine. The Unified Engine renders templates and performs validation, but suppresses the final HTTP dispatch call to Mailjet.
+  2. Implement **Shadow Traffic**: Mirror a small percentage of live transactional triggers to the Unified Engine. The Unified Engine renders templates and performs validation, but suppresses the final HTTP dispatch call to Mailjet.
   3. Benchmark P99 rendering latency and verify template parity against legacy outputs.
 
 ###### Phase 1: Migrate System 1 (Fleet Transactional .NET Azure Functions)
@@ -405,8 +403,8 @@ To address the highest-risk execution path, the platform implements four critica
 |---|---|---|
 | **Template Rendering Drift** | Automated snapshot comparison during Phase 0 shadow testing. | Instant feature flag toggle back to legacy template path per OEM brand. |
 | **Mailjet API Outage / Throttling** | Circuit breakers and exponential backoff retries in Vendor Adapter. | Buffer accepted requests durably in Kafka, monitor backlog age, and resume dispatch under the global rate limit when Mailjet recovers. Define expiry and dead-letter handling for messages that cannot be sent within their business validity window. |
-| **Missing Translation Key in Redis** | Strict Pre-Send Validation Check. For legal/dunning, block send and route to DLQ with alert. | For non-legal marketing, apply OEM-configured primary fallback language. |
-| **Database Migration Instability** | Dual-writing status logs to both legacy and unified databases during cutover. | Roll back DNS/routing rules to legacy services within seconds. |
+| **Missing Translation Key in Redis** | Strict Pre-Send Validation Check. For legal/dunning, block send: persist as `FAILED_CONTENT` and alert operators. | For non-legal marketing, apply OEM-configured primary fallback language. |
+| **Database Migration Instability** | Dual-writing status logs to both legacy and unified databases during cutover. | Flip the per-use-case feature flag back to the legacy path. |
 
 ##### Next Steps & Future Enhancements
 1. **Multi-Channel Expansion**: Implement generic `NotificationChannelAdapter` drivers for Mobile Push (Firebase FCM) and SMS (Twilio).
